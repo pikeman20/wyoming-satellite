@@ -76,6 +76,8 @@ class SatelliteBase:
 
     def __init__(self, settings: SatelliteSettings) -> None:
         self.settings = settings
+        self._is_playing_stt: bool = False
+        self._should_stop_stt: bool = False
         self.server_id: Optional[str] = None
         self._state = State.NOT_STARTED
         self._state_changed = asyncio.Event()
@@ -511,7 +513,6 @@ class SatelliteBase:
                             audio_bytes = chunk.audio
 
                         audio_bytes = self._process_mic_audio(chunk.audio)
-
                     event = AudioChunk(
                         rate=chunk.rate,
                         width=chunk.width,
@@ -576,7 +577,7 @@ class SatelliteBase:
         return None
 
     async def _snd_task_proc(self) -> None:
-        """Snd service loop."""
+        """Enhanced snd service loop with rolling buffer, pacing, and graceful cancel."""
         snd_client: Optional[AsyncClient] = None
 
         async def _disconnect() -> None:
@@ -586,13 +587,53 @@ class SatelliteBase:
             except Exception:
                 pass  # ignore disconnect errors
 
+        # Rolling buffer config
+        buffer_ms = 200
+        min_sleep_ms = 50
+
         while self.is_running:
             try:
                 if self._snd_queue is None:
                     self._snd_queue = asyncio.Queue()
 
-                snd_event = await self._snd_queue.get()
-                event = snd_event.event
+                # Gather a buffer of chunks totaling ~buffer_ms
+                chunk_batch = []
+                batch_duration = 0.0
+                cancel_playback = False
+                while batch_duration < buffer_ms / 1000.0:
+                    # Check for cancel event
+                    if self._should_stop_stt:
+                        _LOGGER.debug("Force stop playback")
+                        cancel_playback = True
+                        self._should_stop_stt = False
+                        
+                        found_stop = False
+                        while not self._snd_queue.empty() and not found_stop:
+                            try:
+                                snd_event = self._snd_queue.get_nowait()
+                                if AudioStop.is_type(snd_event.event.type):
+                                    found_stop = True
+                            except Exception:
+                                break
+                        break
+
+                    if not cancel_playback:
+                        snd_event = await self._snd_queue.get()
+                        event = snd_event.event
+                        chunk_batch.append((snd_event, event))
+                        if AudioChunk.is_type(event.type):
+                            chunk = AudioChunk.from_event(event)
+                            samples = len(chunk.audio) // (chunk.width * chunk.channels)
+                            duration = samples / chunk.rate if chunk.rate else 0
+                            batch_duration += duration
+                            
+                        if not AudioChunk.is_type(event.type):
+                            if AudioStart.is_type(event.type):
+                                self._is_playing_stt = True
+                            elif AudioStop.is_type(event.type):
+                                self._is_playing_stt = False
+                                
+                            break
 
                 if snd_client is None:
                     snd_client = self._make_snd_client()
@@ -601,28 +642,33 @@ class SatelliteBase:
                     _LOGGER.debug("Connected to snd service")
 
                 # Audio processing
-                if self.settings.snd.needs_processing and AudioChunk.is_type(
-                    event.type
-                ):
-                    chunk = AudioChunk.from_event(event)
-                    audio_bytes = self._process_snd_audio(chunk.audio)
-                    event = AudioChunk(
-                        rate=chunk.rate,
-                        width=chunk.width,
-                        channels=chunk.channels,
-                        audio=audio_bytes,
-                    ).event()
+                for snd_event, event in chunk_batch:
+                    if self.settings.snd.needs_processing and AudioChunk.is_type(
+                        event.type
+                    ):
+                        chunk = AudioChunk.from_event(event)
+                        audio_bytes = self._process_snd_audio(chunk.audio)
+                        event = AudioChunk(
+                            rate=chunk.rate,
+                            width=chunk.width,
+                            channels=chunk.channels,
+                            audio=audio_bytes,
+                        ).event()
 
-                await snd_client.write_event(event)
+                    await snd_client.write_event(event)
 
-                if self.settings.snd.disconnect_after_stop and AudioStop.is_type(
-                    event.type
-                ):
-                    await _disconnect()
-                    if snd_event.is_tts:
-                        await self.event_to_server(Played().event())
-                        await self.trigger_played()
-                    snd_client = None  # reconnect on next event
+                    if self.settings.snd.disconnect_after_stop and AudioStop.is_type(
+                        event.type
+                    ):
+                        await _disconnect()
+                        if snd_event.is_tts:
+                            await self.event_to_server(Played().event())
+                            await self.trigger_played()
+                        snd_client = None  # reconnect on next event
+
+                sleep_time = max(batch_duration - (min_sleep_ms / 1000.0), min_sleep_ms / 1000.0)
+                await asyncio.sleep(sleep_time)
+
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -850,6 +896,9 @@ class SatelliteBase:
 
     async def trigger_detection(self, detection: Detection) -> None:
         """Called when wake word is detected."""
+        if self._is_playing_stt:
+            self._should_stop_stt = True
+        
         await run_event_command(self.settings.event.detection, detection.name)
         await self._play_wav(
             self.settings.snd.awake_wav,
