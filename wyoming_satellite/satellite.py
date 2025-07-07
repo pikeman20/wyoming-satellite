@@ -276,6 +276,8 @@ class SatelliteBase:
             forward_event = False
         elif AudioStart.is_type(event.type):
             # TTS started
+            _LOGGER.debug(f"TTS audio started, data: {event.data}")
+            self._play_dummy_sound()   
             await self.event_to_snd(event)
             await self.trigger_tts_start()
         elif AudioStop.is_type(event.type):
@@ -558,6 +560,22 @@ class SatelliteBase:
         """Send an event to the sound service."""
         if self._snd_queue is not None:
             self._snd_queue.put_nowait(SoundEvent(event, is_tts))
+
+    def _play_dummy_sound(self):
+        """Enqueue multiple silent PCM chunks to the sound queue."""
+        num_dummy = 5
+        rate = self.settings.snd.rate
+        width = self.settings.snd.width
+        channels = self.settings.snd.channels
+        samples_per_chunk = self.settings.snd.samples_per_chunk
+        silence_bytes = (b'\x00' * width * channels) * samples_per_chunk
+
+        silent_start = AudioStart(rate=rate, width=width, channels=channels).event()
+        self._snd_queue.put_nowait(SoundEvent(silent_start, False))
+        silent_chunk = AudioChunk(rate=rate, width=width, channels=channels, audio=silence_bytes)
+        for _ in range(num_dummy):
+            self._snd_queue.put_nowait(SoundEvent(silent_chunk.event(), False))
+        self._snd_queue.put_nowait(SoundEvent(AudioStop().event(), False))
 
     def _make_snd_client(self) -> Optional[AsyncClient]:
         """Create client for snd service."""
